@@ -3,8 +3,8 @@ import requests
 import threading
 import time
 from config import BOT_TOKEN, WEBHOOK_URL, ADMIN_IDS, CHANNEL_TAG, PING_INTERVAL
-from database import save_file, get_file
-from utils import gen_code
+from utils import gen_code, save_file, get_files, increase_downloads, get_download_count,
+    add_required_channel, remove_required_channel, list_required_channels, check_user_membership
 
 app = Flask(__name__)
 URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
@@ -37,23 +37,6 @@ def index():
 def webhook():
     update = request.get_json()
 
-    # ابتدا بررسی کنیم اگر پیام start با کد بود
-    if "message" in update and "text" in update["message"] and update["message"]["text"].startswith("/start "):
-        msg = update["message"]
-        cid = msg["chat"]["id"]
-        code = msg["text"].split("/start ")[1]
-        print(f"Received /start with code: {code}")
-        file_id = get_file(code)
-        print(f"File_id retrieved from database: {file_id}")
-        if file_id:
-            sent = send("sendVideo", {"chat_id": cid, "video": file_id})
-            print(f"Sent video response: {sent}")
-            if "result" in sent:
-                mid = sent["result"]["message_id"]
-                send("sendMessage", {"chat_id": cid, "text": "⚠️این محتوا تا ۲۰ ثانیه دیگر پاک میشود "})
-                threading.Timer(20, delete, args=(cid, mid)).start()
-        return "ok"
-
     if "message" in update:
         msg = update["message"]
         uid = msg["from"]["id"]
@@ -62,69 +45,121 @@ def webhook():
         text = msg.get("text", "")
         state = users.get(uid, {})
 
-        if text == "/start":
-            send("sendMessage", {"chat_id": cid, "text": "سلام خوش اومدی عزیزم واسه دریافت فایل مد نظرت از کانال @hottof روی دکمه مشاهده بزن ♥️"})
+        if text.startswith("/start"):
+            args = text.split(" ")
+            if len(args) > 1:
+                code = args[1]
+                async def handle_start():
+                    not_joined = await check_user_membership(requests, uid)
+                    if not_joined:
+                        buttons = [[{"text": ch, "url": f"https://t.me/{ch}"}] for ch in not_joined]
+                        buttons.append([{"text": "عضو شدم✅", "callback_data": f"check:{code}"}])
+                        send("sendMessage", {
+                            "chat_id": cid,
+                            "text": "قبل از دریافت فایل، لطفاً در کانال‌های زیر عضو شو:",
+                            "reply_markup": {"inline_keyboard": buttons}
+                        })
+                    else:
+                        files = get_files(code)
+                        for f in files:
+                            send("sendVideo", {"chat_id": cid, "video": f})
+                        increase_downloads(code)
+                import asyncio
+                asyncio.run(handle_start())
+            else:
+                send("sendMessage", {"chat_id": cid, "text": "سلام خوش اومدی عزیزم واسه دریافت فایل مد نظرت از کانال @hottof روی دکمه مشاهده بزن ♥️"})
 
         elif text == "/panel" and uid in ADMIN_IDS:
-            kb = {"keyboard": [[{"text": "🔞سوپر"}], [{"text": "🖼پست"}]], "resize_keyboard": True}
+            kb = {"keyboard": [[{"text": "🔞سوپر"}], [{"text": "🖼پست"}], [{"text": "⚙️تنظیمات"}]], "resize_keyboard": True}
             send("sendMessage", {"chat_id": cid, "text": "سلام آقا مدیر 🔱", "reply_markup": kb})
 
+        elif text == "⚙️تنظیمات" and uid in ADMIN_IDS:
+            users[uid] = {"step": "settings"}
+            kb = {"keyboard": [[{"text": "➕افزودن کانال"}], [{"text": "➖حذف کانال"}], [{"text": "📋مشاهده کانال‌ها"}], [{"text": "بازگشت"}]], "resize_keyboard": True}
+            send("sendMessage", {"chat_id": cid, "text": "چیکار میخوای بکنی؟", "reply_markup": kb})
+
+        elif text == "➕افزودن کانال" and state.get("step") == "settings":
+            users[uid]["step"] = "adding_channel"
+            send("sendMessage", {"chat_id": cid, "text": "آیدی کانال رو بدون @ بفرست و یادت نره منو ادمین کنی."})
+
+        elif state.get("step") == "adding_channel":
+            add_required_channel(text)
+            users[uid] = {"step": "settings"}
+            send("sendMessage", {"chat_id": cid, "text": "✅ کانال اضافه شد و برگشتیم به تنظیمات"})
+
+        elif text == "➖حذف کانال" and state.get("step") == "settings":
+            users[uid]["step"] = "removing_channel"
+            send("sendMessage", {"chat_id": cid, "text": "آیدی کانالی که میخوای حذف شه رو بدون @ بفرست."})
+
+        elif state.get("step") == "removing_channel":
+            remove_required_channel(text)
+            users[uid] = {"step": "settings"}
+            send("sendMessage", {"chat_id": cid, "text": "❌ کانال حذف شد و برگشتیم به تنظیمات"})
+
+        elif text == "📋مشاهده کانال‌ها" and state.get("step") == "settings":
+            channels = list_required_channels()
+            ch_text = "\n".join(channels) if channels else "هیچ کانالی ثبت نشده."
+            send("sendMessage", {"chat_id": cid, "text": ch_text})
+
+        elif text == "بازگشت":
+            users.pop(uid, None)
+            send("sendMessage", {"chat_id": cid, "text": "برگشتیم به پنل.", "reply_markup": {"keyboard": [[{"text": "🔞سوپر"}], [{"text": "🖼پست"}], [{"text": "⚙️تنظیمات"}]], "resize_keyboard": True}})
+
         elif text == "🔞سوپر" and uid in ADMIN_IDS:
-            users[uid] = {"step": "awaiting_video"}
-            send("sendMessage", {"chat_id": cid, "text": "ای جان یه سوپر ناب برام بفرست 🍌"})
+            users[uid] = {"step": "awaiting_videos", "videos": []}
+            send("sendMessage", {"chat_id": cid, "text": "تا 10 ویدیو بفرست (یکی یکی). وقتی تموم شد، بگو \"تمام\"."})
 
-        elif text == "🖼پست" and uid in ADMIN_IDS:
-            users[uid] = {"step": "awaiting_forward"}
-            send("sendMessage", {"chat_id": cid, "text": "محتوا رو برا فوروارد کن یادت نره تگ بزنی روش ✅️"})
+        elif state.get("step") == "awaiting_videos" and "video" in msg:
+            users[uid]["videos"].append(msg["video"]["file_id"])
+            send("sendMessage", {"chat_id": cid, "text": f"ویدیو دریافت شد ({len(users[uid]['videos'])}/10)"})
 
-        elif state.get("step") == "awaiting_video" and "video" in msg:
-            users[uid]["step"] = "awaiting_caption"
-            users[uid]["file_id"] = msg["video"]["file_id"]
-            print(f"Received video file_id: {users[uid]['file_id']}")
-            send("sendMessage", {"chat_id": cid, "text": "منتظر کپشن خوشکلت هستم 💫"})
-
-        elif state.get("step") == "awaiting_caption":
-            users[uid]["step"] = "awaiting_cover"
-            users[uid]["caption"] = text
-            send("sendMessage", {"chat_id": cid, "text": "یه عکس برای پیش نمایش بهم بده 📸"})
-
-        elif state.get("step") == "awaiting_cover" and "photo" in msg:
-            file_id = users[uid]["file_id"]
-            caption = users[uid]["caption"]
-            cover_id = msg["photo"][-1]["file_id"]
-            code = gen_code()
-            print(f"Saving file with code: {code} and file_id: {file_id}")
-            save_file(file_id, code)
-            text = f"<a href='https://t.me/HotTofBot?start={code}'>مشاهده</a>\n\n{CHANNEL_TAG}"
-            send("sendPhoto", {
-                "chat_id": cid,
-                "photo": cover_id,
-                "caption": caption + "\n\n" + text,
-                "parse_mode": "HTML"
-            })
-            users.pop(uid)
-            send("sendMessage", {
-                "chat_id": cid,
-                "text": "درخواست شما تایید شد✅️",
-                "reply_markup": {"keyboard": [[{"text": "🔞سوپر"}], [{"text": "🖼پست"}]], "resize_keyboard": True}
-            })
-
-        elif state.get("step") == "awaiting_forward" and ("video" in msg or "photo" in msg):
-            users[uid]["step"] = "awaiting_post_caption"
-            users[uid]["post_msg"] = msg
-            send("sendMessage", {"chat_id": cid, "text": "یه کپشن خوشکل بزن حال کنم 😁"})
-
-        elif state.get("step") == "awaiting_post_caption":
-            post_msg = users[uid]["post_msg"]
-            caption = text + "\n\n" + CHANNEL_TAG
-            if "video" in post_msg:
-                fid = post_msg["video"]["file_id"]
-                send("sendVideo", {"chat_id": cid, "video": fid, "caption": caption})
+        elif state.get("step") == "awaiting_videos" and text == "تمام":
+            if not users[uid]["videos"]:
+                send("sendMessage", {"chat_id": cid, "text": "هیچ ویدیویی دریافت نشد."})
             else:
-                fid = post_msg["photo"][-1]["file_id"]
-                send("sendPhoto", {"chat_id": cid, "photo": fid, "caption": caption})
-            users[uid]["step"] = "awaiting_forward"
-            send("sendMessage", {"chat_id": cid, "text": "بفرما اینم درخواستت ✅️ آماده ام پست بعدی رو بفرستی ارباب🔥"})
+                users[uid]["step"] = "awaiting_caption"
+                send("sendMessage", {"chat_id": cid, "text": "کپشن رو بفرست"})
+
+elif text == "تنظیمات" and uid in ADMIN_IDS:
+            kb = {
+                "keyboard": [
+                    [{"text": "➕افزودن کانال"}],
+                    [{"text": "➖حذف کانال"}],
+                    [{"text": "📋مشاهده کانال ها"}],
+                    [{"text": "🔙بازگشت"}]
+                ],
+                "resize_keyboard": True
+            }
+            users[uid] = {"step": "settings_menu"}
+            send("sendMessage", {"chat_id": cid, "text": "چیکار میخوای بکنی؟", "reply_markup": kb})
+
+        elif text == "➕افزودن کانال" and state.get("step") == "settings_menu":
+            users[uid]["step"] = "awaiting_channel_add"
+            send("sendMessage", {"chat_id": cid, "text": "آیدی کانال رو بدون @ بفرست و منو ادمین کن حتماً"})
+
+        elif state.get("step") == "awaiting_channel_add":
+            add_required_channel(text)
+            users.pop(uid)
+            send("sendMessage", {"chat_id": cid, "text": "کانال با موفقیت اضافه شد ✅"})
+
+        elif text == "➖حذف کانال" and state.get("step") == "settings_menu":
+            users[uid]["step"] = "awaiting_channel_remove"
+            send("sendMessage", {"chat_id": cid, "text": "آیدی کانال رو بدون @ بفرست که حذف کنم"})
+
+        elif state.get("step") == "awaiting_channel_remove":
+            remove_required_channel(text)
+            users.pop(uid)
+            send("sendMessage", {"chat_id": cid, "text": "کانال حذف شد ✅"})
+
+        elif text == "📋مشاهده کانال ها" and state.get("step") == "settings_menu":
+            chs = list_required_channels()
+            txt = "\n".join([f"- @{ch}" for ch in chs]) if chs else "هیچ کانالی تنظیم نشده"
+            send("sendMessage", {"chat_id": cid, "text": txt})
+
+        elif text == "🔙بازگشت" and state.get("step") == "settings_menu":
+            users.pop(uid)
+            kb = {"keyboard": [[{"text": "🔞سوپر"}], [{"text": "🖼پست"}], [{"text": "تنظیمات"}]], "resize_keyboard": True}
+            send("sendMessage", {"chat_id": cid, "text": "بازگشتیم به پنل اصلی", "reply_markup": kb})
 
     return "ok"
 
